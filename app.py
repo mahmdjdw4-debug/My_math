@@ -1,19 +1,22 @@
 import os
 import requests
 from flask import Flask, request
-import google.generativeai as genai
+from google import genai
 
 app = Flask(__name__)
 
-# سحب المفاتيح من Render
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # التصحيح: استهداف النسخة المستقرة مباشرة
-    model = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def get_gemini_reply(text):
+    response = client.responses.create(
+        model="gemini-1.5-flash",
+        input=text
+    )
+    return response.output_text
 
 def send_fb_message(recipient_id, text):
     url = "https://graph.facebook.com/v21.0/me/messages"
@@ -37,15 +40,10 @@ def webhook():
                 if "message" in event and "text" in event["message"]:
                     user_text = event["message"]["text"]
                     try:
-                        # تعديل بسيط لضمان التوافق
-                        response = model.generate_content(user_text)
-                        if response.text:
-                            send_fb_message(sender_id, response.text)
-                        else:
-                            send_fb_message(sender_id, "لم أستطع معالجة هذا الطلب، حاول مرة أخرى.")
+                        reply = get_gemini_reply(user_text)
+                        send_fb_message(sender_id, reply)
                     except Exception as e:
-                        # إرسال الخطأ الحقيقي للمتابعة
-                        send_fb_message(sender_id, f"Error Detail: {str(e)}")
+                        send_fb_message(sender_id, f"خطأ: {str(e)}")
     return "ok", 200
 
 if __name__ == "__main__":
