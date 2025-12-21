@@ -9,36 +9,28 @@ FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# إعداد المكتبة
+# إعداد المكتبة مع فرض الإصدار المستقر v1
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY, transport='rest')
+    genai.configure(
+        api_key=GEMINI_API_KEY, 
+        transport='rest',
+        client_options={'api_version': 'v1'}
+    )
 
-# دالة ذكية لاختيار النموذج المتاح
 def get_response_from_gemini(text):
     try:
-        # المحاولة الأولى: النموذج السريع والاقتصادي
+        # استخدام موديل فلاش في الإصدار المستقر
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(text)
         return response.text
-    except Exception as e_flash:
-        print(f"Flash Failed: {e_flash}")
-        try:
-            # المحاولة الثانية: النموذج القياسي (أكثر استقراراً في بعض المناطق)
-            model_backup = genai.GenerativeModel('gemini-pro')
-            response = model_backup.generate_content(text)
-            return response.text
-        except Exception as e_pro:
-            # إذا فشل الاثنان، نعيد رسالة الخطأ التقنية للتشخيص
-            return f"Error: Models failed. Flash: {str(e_flash)} | Pro: {str(e_pro)}"
+    except Exception as e:
+        return f"Gemini API Error (v1): {str(e)}"
 
 def send_fb_message(recipient_id, text):
     url = f"https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": FB_PAGE_ACCESS_TOKEN}
     payload = {"recipient": {"id": recipient_id}, "message": {"text": text}}
-    try:
-        requests.post(url, params=params, json=payload)
-    except Exception as e:
-        print(f"Facebook Send Error: {e}")
+    requests.post(url, params=params, json=payload)
 
 @app.route("/", methods=['GET'])
 def verify():
@@ -57,24 +49,19 @@ def webhook():
                     if "text" in event["message"]:
                         user_text = event["message"]["text"]
                         
-                        # --- كود التشخيص السري ---
-                        # إذا أرسلت كلمة /debug للبوت، سيرد عليك بقائمة النماذج المتاحة
-                        if user_text.strip() == "/debug":
+                        # تشخيص سريع للنماذج المتاحة عند طلب debug
+                        if user_text.strip().lower() == "/debug":
                             try:
-                                available_models = [m.name for m in genai.list_models()]
-                                debug_msg = "Available Models:\n" + "\n".join(available_models)
-                                send_fb_message(sender_id, debug_msg[:1900]) # قص الرسالة لتناسب فيسبوك
+                                models = [m.name for m in genai.list_models()]
+                                send_fb_message(sender_id, f"Models on v1: {models}")
                             except Exception as e:
                                 send_fb_message(sender_id, f"Debug Error: {str(e)}")
                             continue
-                        # -------------------------
 
-                        # معالجة الرسالة العادية
                         ai_reply = get_response_from_gemini(user_text)
                         send_fb_message(sender_id, ai_reply)
                             
     return "ok", 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
