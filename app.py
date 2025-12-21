@@ -2,7 +2,6 @@ import os
 import requests
 from flask import Flask, request
 import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 app = Flask(__name__)
 
@@ -10,23 +9,27 @@ FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# 1. تهيئة Gemini مع فرض استخدام REST بدلاً من GRPC لتجنب مشاكل المنافذ في Render
+# إعداد المكتبة
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY, transport='rest')
 
-# 2. إعدادات الأمان: السماح بكل شيء (للتجربة والتشخيص)
-# هذا يمنع النموذج من حجب الردود مما يسبب خطأ عند طلب .text
-safety_settings = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
-
-model = genai.GenerativeModel(
-    'gemini-1.5-flash',
-    safety_settings=safety_settings
-)
+# دالة ذكية لاختيار النموذج المتاح
+def get_response_from_gemini(text):
+    try:
+        # المحاولة الأولى: النموذج السريع والاقتصادي
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(text)
+        return response.text
+    except Exception as e_flash:
+        print(f"Flash Failed: {e_flash}")
+        try:
+            # المحاولة الثانية: النموذج القياسي (أكثر استقراراً في بعض المناطق)
+            model_backup = genai.GenerativeModel('gemini-pro')
+            response = model_backup.generate_content(text)
+            return response.text
+        except Exception as e_pro:
+            # إذا فشل الاثنان، نعيد رسالة الخطأ التقنية للتشخيص
+            return f"Error: Models failed. Flash: {str(e_flash)} | Pro: {str(e_pro)}"
 
 def send_fb_message(recipient_id, text):
     url = f"https://graph.facebook.com/v19.0/me/messages"
@@ -54,28 +57,21 @@ def webhook():
                     if "text" in event["message"]:
                         user_text = event["message"]["text"]
                         
-                        try:
-                            # طباعة النص الواصل في الـ Log للتأكد
-                            print(f"Received text: {user_text}")
-                            
-                            response = model.generate_content(user_text)
-                            
-                            # التحقق الآمن من الرد
-                            # إذا تم الحجب، response.text ترمي خطأ، لذلك نتحقق من الأجزاء
-                            if response.candidates and response.candidates[0].content.parts:
-                                reply_text = response.text
-                            else:
-                                # في حال رد النموذج فارغاً أو محجوباً رغم الإعدادات
-                                reply_text = "وصلت رسالتك لكن لم أستطع توليد رد (Blocked/Empty)."
-                                print(f"Feedback: {response.prompt_feedback}")
+                        # --- كود التشخيص السري ---
+                        # إذا أرسلت كلمة /debug للبوت، سيرد عليك بقائمة النماذج المتاحة
+                        if user_text.strip() == "/debug":
+                            try:
+                                available_models = [m.name for m in genai.list_models()]
+                                debug_msg = "Available Models:\n" + "\n".join(available_models)
+                                send_fb_message(sender_id, debug_msg[:1900]) # قص الرسالة لتناسب فيسبوك
+                            except Exception as e:
+                                send_fb_message(sender_id, f"Debug Error: {str(e)}")
+                            continue
+                        # -------------------------
 
-                            send_fb_message(sender_id, reply_text)
-                            
-                        except Exception as e:
-                            # هذا السطر هو الأهم: سيطبع الخطأ الحقيقي في Render Logs
-                            print(f"CRITICAL GEMINI ERROR: {str(e)}")
-                            # إرسال رسالة الخطأ للمستخدم أيضاً للمساعدة في التشخيص السريع
-                            send_fb_message(sender_id, f"Error: {str(e)}")
+                        # معالجة الرسالة العادية
+                        ai_reply = get_response_from_gemini(user_text)
+                        send_fb_message(sender_id, ai_reply)
                             
     return "ok", 200
 
