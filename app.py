@@ -1,37 +1,41 @@
 import os
 import requests
 from flask import Flask, request
-import google.generativeai as genai  # استخدام المكتبة القياسية
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 app = Flask(__name__)
 
-# إعدادات البيئة
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# تهيئة Gemini SDK
+# 1. تهيئة Gemini مع فرض استخدام REST بدلاً من GRPC لتجنب مشاكل المنافذ في Render
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("Warning: GOOGLE_API_KEY is missing!")
+    genai.configure(api_key=GEMINI_API_KEY, transport='rest')
 
-# إعداد النموذج (يمكنك تغيير generation_config هنا إذا أردت)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# 2. إعدادات الأمان: السماح بكل شيء (للتجربة والتشخيص)
+# هذا يمنع النموذج من حجب الردود مما يسبب خطأ عند طلب .text
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+model = genai.GenerativeModel(
+    'gemini-1.5-flash',
+    safety_settings=safety_settings
+)
 
 def send_fb_message(recipient_id, text):
-    # استخدام الإصدار الأحدث من Graph API (v21.0 جيد، لكن v19.0+ كافٍ)
     url = f"https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": FB_PAGE_ACCESS_TOKEN}
-    # فيسبوك يتطلب أحياناً تقسيم الرسائل الطويلة (أكثر من 2000 حرف)
-    # لكن سنرسلها كما هي للتبسيط الآن
     payload = {"recipient": {"id": recipient_id}, "message": {"text": text}}
-    
     try:
-        r = requests.post(url, params=params, json=payload)
-        r.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to send message: {e}")
+        requests.post(url, params=params, json=payload)
+    except Exception as e:
+        print(f"Facebook Send Error: {e}")
 
 @app.route("/", methods=['GET'])
 def verify():
@@ -50,27 +54,31 @@ def webhook():
                     if "text" in event["message"]:
                         user_text = event["message"]["text"]
                         
-                        # -- بداية منطق Gemini --
                         try:
-                            # استدعاء مباشر وسلس للنموذج
+                            # طباعة النص الواصل في الـ Log للتأكد
+                            print(f"Received text: {user_text}")
+                            
                             response = model.generate_content(user_text)
                             
-                            # التأكد من وجود نص في الرد (أحياناً يتم حجب الرد بسبب Safety Filters)
-                            if response.text:
+                            # التحقق الآمن من الرد
+                            # إذا تم الحجب، response.text ترمي خطأ، لذلك نتحقق من الأجزاء
+                            if response.candidates and response.candidates[0].content.parts:
                                 reply_text = response.text
                             else:
-                                reply_text = "عذراً، لم أتمكن من صياغة رد مناسب."
-                                
+                                # في حال رد النموذج فارغاً أو محجوباً رغم الإعدادات
+                                reply_text = "وصلت رسالتك لكن لم أستطع توليد رد (Blocked/Empty)."
+                                print(f"Feedback: {response.prompt_feedback}")
+
                             send_fb_message(sender_id, reply_text)
                             
                         except Exception as e:
-                            print(f"Gemini API Error: {e}")
-                            send_fb_message(sender_id, "واجهت مشكلة تقنية بسيطة، حاول مرة أخرى لاحقاً.")
-                        # -- نهاية منطق Gemini --
-                        
+                            # هذا السطر هو الأهم: سيطبع الخطأ الحقيقي في Render Logs
+                            print(f"CRITICAL GEMINI ERROR: {str(e)}")
+                            # إرسال رسالة الخطأ للمستخدم أيضاً للمساعدة في التشخيص السريع
+                            send_fb_message(sender_id, f"Error: {str(e)}")
+                            
     return "ok", 200
 
 if __name__ == "__main__":
-    # استخدام المنفذ الذي تحدده Render
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
