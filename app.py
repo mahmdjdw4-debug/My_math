@@ -1,163 +1,77 @@
 import os
-import json
 import requests
 from flask import Flask, request
 
 app = Flask(__name__)
 
-# =========================
-# Environment Variables
-# =========================
-
+# الإعدادات من Render
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
-FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
+FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# =========================
-# Gemini API Configuration
-# =========================
-
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
-
-
-# =========================
-# Utility: Log helper
-# =========================
-
-def log(title, data=None):
-    print("\n" + "=" * 40)
-    print(title)
-    if data is not None:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    print("=" * 40 + "\n")
-
-
-# =========================
-# Gemini: List Models (Debug)
-# =========================
-
-def list_gemini_models():
-    url = f"{GEMINI_BASE_URL}/models?key={GEMINI_API_KEY}"
-    response = requests.get(url)
-
-    log("Gemini List Models - Status", response.status_code)
-
+def get_gemini_response(text):
+    """
+    محاولة استدعاء Gemini 2.0 Flash عبر مسار v1beta الموثق حديثاً.
+    """
+    # استخدام gemini-2.0-flash كما اقترح النموذج الآخر
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    headers = {'Content-Type': 'application/json'}
+    payload = {"contents": [{"parts": [{"text": text}]}]}
+    
     try:
-        return response.json()
-    except Exception:
-        return {"error": "Invalid JSON from Gemini"}
+        response = requests.post(url, json=payload, headers=headers, timeout=25)
+        response_data = response.json()
+        
+        # طباعة الحالة في سجلات Render للتشخيص
+        print(f"Gemini Status: {response.status_code}")
+        
+        if response.status_code == 200 and 'candidates' in response_data:
+            return response_data['candidates'][0]['content']['parts'][0]['text']
+        else:
+            # إذا فشل 2.0، نحاول العودة لـ 1.5 بشكل تلقائي
+            return retry_with_15_flash(text)
+            
+    except Exception as e:
+        return f"فشل في الاتصال: {str(e)}"
 
-
-# =========================
-# Gemini: Generate Content
-# =========================
-
-def generate_gemini_response(user_text):
-    url = (
-        f"{GEMINI_BASE_URL}/models/"
-        f"{DEFAULT_GEMINI_MODEL}:generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
-
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_text}]
-            }
-        ]
-    }
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    response = requests.post(url, json=payload, headers=headers)
-
-    log("Gemini Response Status", response.status_code)
-    log("Gemini Raw Response", response.text)
-
-    if response.status_code != 200:
-        return "⚠️ حدث خطأ أثناء الاتصال بنموذج الذكاء الاصطناعي."
-
-    data = response.json()
-
+def retry_with_15_flash(text):
+    """دالة احتياطية في حال عدم توفر إصدار 2.0"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        return "⚠️ لم أتمكن من فهم رد النموذج."
+        resp = requests.post(url, json={"contents": [{"parts": [{"text": text}]}]}, headers={'Content-Type': 'application/json'})
+        data = resp.json()
+        if 'candidates' in data:
+            return data['candidates'][0]['content']['parts'][0]['text']
+        return f"خطأ من جوجل (404): الموديل غير متاح لمفتاحك حالياً."
+    except:
+        return "عذراً، هناك مشكلة فنية في الوصول للنماذج."
 
+def send_fb_message(recipient_id, text):
+    fb_url = f"https://graph.facebook.com/v21.0/me/messages"
+    params = {"access_token": FB_PAGE_ACCESS_TOKEN}
+    payload = {"recipient": {"id": recipient_id}, "message": {"text": text}}
+    requests.post(fb_url, params=params, json=payload)
 
-# =========================
-# Facebook: Send Message
-# =========================
+@app.route("/", methods=['GET'])
+def verify():
+    if request.args.get("hub.verify_token") == FB_VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Bot Online", 200
 
-def send_facebook_message(recipient_id, text):
-    url = (
-        "https://graph.facebook.com/v18.0/me/messages"
-        f"?access_token={FB_PAGE_ACCESS_TOKEN}"
-    )
-
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text}
-    }
-
-    response = requests.post(url, json=payload)
-
-    log("Facebook Send Status", response.status_code)
-    log("Facebook Send Response", response.text)
-
-
-# =========================
-# Webhook Verification
-# =========================
-
-@app.route("/", methods=["GET"])
-def verify_webhook():
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if token == FB_VERIFY_TOKEN:
-        return challenge, 200
-
-    return "Verification failed", 403
-
-
-# =========================
-# Webhook Receiver
-# =========================
-
-@app.route("/", methods=["POST"])
+@app.route("/", methods=['POST'])
 def webhook():
     data = request.json
-    log("Incoming Webhook", data)
-
-    try:
+    if data and data.get("object") == "page":
         for entry in data.get("entry", []):
-            for messaging_event in entry.get("messaging", []):
-                sender_id = messaging_event["sender"]["id"]
-
-                if "message" in messaging_event:
-                    text = messaging_event["message"].get("text")
-
-                    if text:
-                        ai_reply = generate_gemini_response(text)
-                        send_facebook_message(sender_id, ai_reply)
-
-    except Exception as e:
-        log("Webhook Processing Error", str(e))
-
+            for event in entry.get("messaging", []):
+                sender_id = event.get("sender", {}).get("id")
+                if sender_id and "message" in event and "text" in event["message"]:
+                    user_text = event["message"]["text"]
+                    ai_reply = get_gemini_response(user_text)
+                    send_fb_message(sender_id, ai_reply)
     return "ok", 200
 
-
-# =========================
-# Optional: Manual Debug Route
-# =========================
-
-@app.route("/debug/models", methods=["GET"])
-def debug_models():
-    models = list_gemini_models()
-    return models, 200
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
