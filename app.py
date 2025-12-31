@@ -1,132 +1,151 @@
 import os
 import requests
-import base64
+import google.generativeai as genai
 from flask import Flask, request
+from PIL import Image
+import io
 
 app = Flask(__name__)
 
-# =======================
-# إعدادات البيئة
-# =======================
+# ====== الإعدادات والمفاتيح ======
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
-GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-FB_MAX_CHUNK = 1900
-MAX_HISTORY_MESSAGES = 4
-conversation_memory = {}
+# إعداد مكتبة Gemini الرسمية
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# =======================
-# أدوات مساعدة
-# =======================
-def chunk_text(text, max_len=FB_MAX_CHUNK):
-    text = (text or "").strip()
+# إعدادات الموديل (تخفيف القيود ليشرح العلوم بحرية)
+generation_config = {
+    "temperature": 0.3,  # دقة أعلى للإجابات العلمية
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 4000, # نسمح بإجابات طويلة جداً ليتم تقطيعها لاحقاً
+    "response_mime_type": "text/plain",
+}
+
+# إعدادات الأمان (مهم جداً لأسئلة مثل نظرية التطور)
+safety_settings = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash", # موديل سريع وذكي جداً مع الصور
+    generation_config=generation_config,
+    safety_settings=safety_settings
+)
+
+# ====== ذاكرة المؤقتة (اختيارية) ======
+# ملاحظة: في Render النسخة المجانية، الذاكرة تمحى عند إعادة التشغيل.
+# لغرض التبسيط سنعتمد على سياق الرسالة الحالية والصورة.
+conversations = {} 
+
+# ====== دوال المساعدة ======
+
+def get_sender_identity_response():
+    return "صنعني شخص اسمه محمد الامين احمد جدو. هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
+
+def split_message(text, limit=1900):
+    """تقسيم النص الطويل إلى أجزاء آمنة لفيسبوك"""
     chunks = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        cut = max(
-            text.rfind("\n", 0, max_len),
-            text.rfind(". ", 0, max_len),
-            text.rfind(" ", 0, max_len),
-        )
-        if cut <= 0:
-            cut = max_len
-        chunks.append(text[:cut])
-        text = text[cut:].strip()
+    while len(text) > limit:
+        # حاول القص عند أقرب سطر جديد لتكون القراءة مريحة
+        split_index = text.rfind('\n', 0, limit)
+        if split_index == -1:
+            split_index = text.rfind(' ', 0, limit)
+        
+        if split_index == -1:
+            split_index = limit
+            
+        chunks.append(text[:split_index])
+        text = text[split_index:].strip()
+    
+    if text:
+        chunks.append(text)
     return chunks
 
-
 def send_fb_message(recipient_id, text):
-    url = "https://graph.facebook.com/v21.0/me/messages"
-    params = {"access_token": FB_PAGE_ACCESS_TOKEN}
-    for chunk in chunk_text(text):
-        requests.post(
-            url,
-            params=params,
-            json={"recipient": {"id": recipient_id}, "message": {"text": chunk}},
-            timeout=15,
-        )
+    """إرسال الرسالة مقسمة إلى فيسبوك"""
+    if not text: return
+    
+    chunks = split_message(text)
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={FB_PAGE_ACCESS_TOKEN}"
+    
+    for chunk in chunks:
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {"text": chunk}
+        }
+        try:
+            r = requests.post(url, json=payload)
+            if r.status_code != 200:
+                print(f"Error sending to FB: {r.text}")
+        except Exception as e:
+            print(f"Exception sending to FB: {e}")
 
+def get_image_from_url(url):
+    """تحميل الصورة وتجهيزها لجيمناي"""
+    try:
+        response = requests.get(url, timeout=20)
+        if response.status_code == 200:
+            image_data = response.content
+            return Image.open(io.BytesIO(image_data))
+    except Exception as e:
+        print(f"Error downloading image: {e}")
+    return None
 
-def clean_math_text(text):
-    bad = ["{", "}", "[", "]", "\\frac"]
-    for b in bad:
-        text = text.replace(b, "")
-    return text
+def generate_gemini_response(user_text, image_obj=None):
+    # 1. التحقق من سؤال الهوية أولاً
+    if user_text:
+        check_text = user_text.lower()
+        if any(x in check_text for x in ["من صنعك", "من برمجك", "who made you", "خالقك", "مطورك"]):
+            return get_sender_identity_response()
 
+    # 2. بناء "السيستم برومبت" القوي
+    system_instruction = """
+    أنت معلم ذكي ومتميز متخصص في الفيزياء، الرياضيات، والعلوم.
+    
+    القواعد الصارمة لإجابتك:
+    1. **اللغة:** اشرح باللغة العربية الفصحى المبسطة جداً، ولكن احتفظ بالمصطلحات العلمية (Scientific Terms) باللغة الفرنسية (مثل: Force, Vitesse, Energie).
+    2. **الأسلوب:** لا تكتفِ بشرح "كيف" (How) بل اشرح "لماذا" (Why) دائماً. فصّل الإجابة تفصيلاً دقيقاً ومملاً.
+    3. **التنسيق:** - استخدم الترقيم (1- ، 2- ...) للخطوات.
+       - **ممنوع تماماً** استخدام كود LaTeX أو رموز مثل `\\frac`, `^{}`, `[]`, `{}`.
+       - اكتب المعادلات بشكل نصي مفهوم (مثال: بدلاً من كسر، اكتب "القوة مقسومة على الكتلة").
+       - اجعل النص مقروءاً لرسائل فيسبوك.
+    4. **حل التمارين:** إذا أُرسلت صورة تمرين، استخرج المعطيات، اشرح القانون المستخدم، ثم الحل خطوة بخطوة.
+    5. **الشخصية:** أنت صبور، ودود، وتحب التفاصيل.
+    """
+    
+    prompts = [system_instruction]
+    
+    # إضافة الصورة إذا وجدت
+    if image_obj:
+        prompts.append("هذه صورة تمرين أو سؤال علمي. قم بتحليلها بدقة وحل ما فيها.")
+        prompts.append(image_obj)
+    
+    if user_text:
+        prompts.append(f"\nسؤال المستخدم: {user_text}")
 
-# =======================
-# Prompt ذكي
-# =======================
-def build_prompt(sender_id, user_text):
-    history = conversation_memory.get(sender_id, [])
-    context = ""
-    for h in history[-MAX_HISTORY_MESSAGES:]:
-        context += f"المستخدم: {h['user']}\nالمساعد: {h['bot']}\n"
+    # طلب الإجابة من Gemini
+    try:
+        response = model.generate_content(prompts)
+        return response.text
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        # إذا كان الخطأ بسبب المحتوى، نحاول رسالة عامة
+        return "واجهت مشكلة تقنية في معالجة هذا الطلب، حاول إعادة صياغة السؤال."
 
-    system = """
-أنت مساعد تعليمي متخصص في الفيزياء والرياضيات والعلوم.
-الشرح بالعربية، والمصطلحات العلمية بالفرنسية.
-اشرح لماذا قبل كيف.
-أسلوب مبسط، مفصل، مرقم.
-اكتب المعادلات بالكلمات فقط.
-"""
+# ====== Webhook Handlers ======
 
-    return system + "\n" + context + "\nسؤال المستخدم:\n" + user_text
-
-
-# =======================
-# Gemini (نص + صورة)
-# =======================
-def gemini_generate(parts):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
-
-    payload = {
-        "contents": [{"parts": parts}],
-        "temperature": 0.2,
-        "max_output_tokens": 700,
-    }
-
-    r = requests.post(url, json=payload, headers=headers, timeout=40)
-    if r.status_code != 200:
-        print("Gemini error:", r.text)
-        return "❌ حدث خطأ أثناء معالجة السؤال."
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-
-def get_gemini_response(sender_id, user_text):
-    if "من صنعك" in user_text or "من برمجك" in user_text:
-        return (
-            "صنعني شخص اسمه محمد الأمين أحمد جدو.\n"
-            "هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
-        )
-
-    prompt = build_prompt(sender_id, user_text)
-    answer = gemini_generate([{"text": prompt}])
-    answer = clean_math_text(answer)
-
-    conversation_memory.setdefault(sender_id, []).append(
-        {"user": user_text, "bot": answer}
-    )
-
-    return answer
-
-
-# =======================
-# Webhook
-# =======================
 @app.route("/", methods=["GET"])
 def verify():
+    # تأكيد ربط فيسبوك
     if request.args.get("hub.verify_token") == FB_VERIFY_TOKEN:
         return request.args.get("hub.challenge")
-    return "ok", 200
-
+    return "Verification failed", 403
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -134,42 +153,35 @@ def webhook():
     if data and data.get("object") == "page":
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
-                sender_id = event["sender"]["id"]
-                msg = event.get("message", {})
+                sender_id = event.get("sender", {}).get("id")
+                
+                # نتجاهل رسائل البوت لنفسه أو حالات التسليم
+                if not sender_id or "delivery" in event or "read" in event:
+                    continue
 
-                # نص
-                if "text" in msg:
-                    reply = get_gemini_response(sender_id, msg["text"])
-                    send_fb_message(sender_id, reply)
+                if "message" in event:
+                    msg = event["message"]
+                    user_text = msg.get("text", "")
+                    
+                    # التعامل مع الصور
+                    image_obj = None
+                    attachments = msg.get("attachments", [])
+                    for att in attachments:
+                        if att.get("type") == "image":
+                            img_url = att.get("payload", {}).get("url")
+                            image_obj = get_image_from_url(img_url)
+                            # نأخذ أول صورة فقط حالياً
+                            break 
+                    
+                    # نرسل "جاري الكتابة..." لأن الإجابة قد تتأخر
+                    # (يمكن إضافة action: typing_on هنا اختيارياً)
 
-                # صورة
-                if "attachments" in msg:
-                    for att in msg["attachments"]:
-                        if att["type"] == "image":
-                            image_url = att["payload"]["url"]
-                            img = requests.get(image_url).content
-                            b64 = base64.b64encode(img).decode()
-
-                            prompt = build_prompt(
-                                sender_id,
-                                "اشرح التمرين الموجود في الصورة شرحًا مفصلاً."
-                            )
-
-                            answer = gemini_generate([
-                                {"text": prompt},
-                                {
-                                    "inline_data": {
-                                        "mime_type": "image/jpeg",
-                                        "data": b64,
-                                    }
-                                },
-                            ])
-
-                            send_fb_message(sender_id, clean_math_text(answer))
+                    # معالجة الطلب
+                    if user_text or image_obj:
+                        ai_reply = generate_gemini_response(user_text, image_obj)
+                        send_fb_message(sender_id, ai_reply)
 
     return "ok", 200
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
