@@ -52,7 +52,7 @@ def ocr_google(image_url):
         }
 
         r = requests.post(url, json=payload, timeout=25)
-        text = r.json()["responses"][0].get("fullTextAnnotation", {}).get("text", "")
+        text = r.json()["responses"][0]["fullTextAnnotation"]["text"]
         return text[:1200]  # 🔐 حد أمان
     except:
         return ""
@@ -78,13 +78,19 @@ def call_gemini(model, prompt):
 # ====== AI logic ======
 def get_ai_reply(user_text, ocr_text=""):
     lower = user_text.lower()
+
+    # الردود العامة والتحيات
+    greetings = ["مرحبا", "السلام عليكم", "اهلا", "hello", "hi"]
+    if any(g in lower for g in greetings):
+        return "أهلاً بك! 😊 كيف يمكنني مساعدتك اليوم؟"
+
     if any(x in lower for x in ["من صنعك", "من برمجك", "who made you"]):
         return (
             "صنعني شخص اسمه محمد الأمين أحمد جدو.\n"
             "هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
         )
 
-    # قالب تعليمي عام
+    # ====== تحضير prompt للأسئلة الدراسية ======
     prompt = f"""
 أجب وفق هذا القالب فقط:
 
@@ -141,6 +147,7 @@ def verify():
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.json
+
     if data and data.get("object") == "page":
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
@@ -149,23 +156,14 @@ def webhook():
                     continue
 
                 msg = event.get("message", {})
-                user_text = msg.get("text", "")  # نص الرسالة العادي
+                user_text = msg.get("text", "")
+
                 ocr_text = ""
-
-                # معالجة الصور
-                attachments = msg.get("attachments", [])
-                for att in attachments:
+                for att in msg.get("attachments", []):
                     if att.get("type") == "image":
-                        ocr_result = ocr_google(att["payload"]["url"])
-                        if ocr_result:
-                            ocr_text += ("\n" + ocr_result) if ocr_text else ocr_result
+                        ocr_text = ocr_google(att["payload"]["url"])
 
-                # إذا لم يكن هناك نص عادي ولكن الصورة أعطت نصًا
-                if not user_text and ocr_text:
-                    user_text = ocr_text  # نجعل النص المستخرج هو مدخل البوت
-
-                # إذا هناك أي نص، نفكر إذا كان سؤال دراسي أو مجرد نص
-                if user_text:
+                if user_text or ocr_text:
                     reply = get_ai_reply(user_text, ocr_text)
                     send_fb_message(sender_id, reply)
 
