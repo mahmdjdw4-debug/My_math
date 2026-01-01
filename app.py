@@ -1,6 +1,7 @@
 import os
 import requests
 import base64
+import threading # أضفت هذا لضمان عدم توقف البوت عند فيسبوك (Timeout)
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -9,133 +10,68 @@ app = Flask(__name__)
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
-VISION_API_KEY = os.environ.get("VISION_API_KEY")
 
-# ====== Facebook helpers ======
-def chunk_text(text, limit=1900):
-    parts = []
-    while len(text) > limit:
-        cut = text.rfind(" ", 0, limit)
-        if cut == -1:
-            cut = limit
-        parts.append(text[:cut])
-        text = text[cut:]
-    parts.append(text)
-    return parts
-
+# ====== مساعدات فيسبوك (نفس كودك الأصلي مع تحسين بسيط) ======
 def send_fb_message(sender_id, text):
     url = "https://graph.facebook.com/v21.0/me/messages"
     params = {"access_token": FB_PAGE_ACCESS_TOKEN}
-
-    for part in chunk_text(text):
+    # تقسيم النص لضمان وصول الرسائل الطويلة
+    limit = 1900
+    for i in range(0, len(text), limit):
         payload = {
             "recipient": {"id": sender_id},
-            "message": {"text": part.strip()}
+            "message": {"text": text[i:i+limit].strip()}
         }
         requests.post(url, params=params, json=payload)
 
-# ====== OCR (آمن) ======
-def ocr_google(image_url):
-    if not VISION_API_KEY:
-        return ""
+# ====== المحرك الذكي الجديد (هنا التطوير الحقيقي) ======
+def get_ai_reply_multimodal(user_text, image_url=None):
+    # المنهجية التعليمية التي طلبتها في الـ Prompt
+    system_prompt = """
+أنت مساعد تعليمي خبير. اتبع المنهجية التالية في الشرح بدقة:
+1. الكل قبل الجزء: ابدأ بنظرة شاملة للسؤال وسياقه العلمي (الهدف النهائي).
+2. التفكيك (ماذا، كيف، لماذا):
+   - ماذا: ما هو المفهوم المستخدم؟
+   - كيف: كيف نطبق القوانين خطوة بخطوة؟
+   - لماذا: لماذا اخترنا هذا الطريق للحل؟
+3. فقه السؤال: اربط الحل بكيفية الإجابة في الامتحان وتجنب الأخطاء الشائعة.
 
-    try:
-        img = requests.get(image_url, timeout=20).content
-        encoded = base64.b64encode(img).decode()
-
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={VISION_API_KEY}"
-        payload = {
-            "requests": [{
-                "image": {"content": encoded},
-                "features": [{"type": "TEXT_DETECTION"}]
-            }]
-        }
-
-        r = requests.post(url, json=payload, timeout=25)
-        text = r.json()["responses"][0]["fullTextAnnotation"]["text"]
-        return text[:1200]  # 🔐 حد أمان
-    except:
-        return ""
-
-# ====== Gemini caller (مع fallback) ======
-def call_gemini(model, prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-    }
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=35)
-        if r.status_code != 200:
-            return None
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        return None
-
-# ====== AI logic ======
-def get_ai_reply(user_text, ocr_text=""):
-    lower = user_text.lower()
-
-    # الردود العامة والتحيات
-    greetings = ["مرحبا", "السلام عليكم", "اهلا", "hello", "hi"]
-    if any(g in lower for g in greetings):
-        return "أهلاً بك! 😊 كيف يمكنني مساعدتك اليوم؟"
-
-    if any(x in lower for x in ["من صنعك", "من برمجك", "who made you"]):
-        return (
-            "صنعني شخص اسمه محمد الأمين أحمد جدو.\n"
-            "هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
-        )
-
-    # ====== تحضير prompt للأسئلة الدراسية ======
-    prompt = f"""
-أجب وفق هذا القالب فقط:
-
-1) فهم السؤال
-2) المعطيات (Données)
-3) الفكرة العلمية مع شرح لماذا
-4) الحل خطوة بخطوة
-5) الخلاصة
-
-قواعد:
-- الشرح بالعربية المبسطة
-- المصطلحات العلمية بالفرنسية
-- ممنوع LaTeX أو frac أو {{}} []
-- أسلوب تعليمي لطالب ثانوي
-
-السؤال:
-{user_text}
+قواعد صارمة:
+- اللغة: العربية المبسطة مع المصطلحات العلمية بالفرنسية.
+- التنسيق: ممنوع استخدام رموز LaTeX مثل [ ] { } \frac. استخدم رموزاً بسيطة (مثلاً: / للقسمة، * للضرب).
+- إذا كانت هناك صورة: حللها بصرياً بدقة (رسوم، جداول، معادلات).
 """
 
-    if ocr_text:
-        prompt += f"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    parts = [{"text": f"{system_prompt}\n\nسؤال المستخدم: {user_text}"}]
+    
+    if image_url:
+        try:
+            img_data = requests.get(image_url).content
+            encoded_img = base64.b64encode(img_data).decode()
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": encoded_img
+                }
+            })
+        except:
+            pass # في حال فشل جلب الصورة نعتمد على النص
 
-نص مستخرج من صورة (قد يحتوي أخطاء OCR):
----
-{ocr_text}
----
-"""
+    payload = {"contents": [{"parts": parts}]}
+    
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        response_data = r.json()
+        return response_data['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        return f"عذراً، واجهت مشكلة في معالجة الطلب. (Error: {str(e)})"
 
-    # 🧠 النموذج الذكي أولًا
-    answer = call_gemini("gemini-1.5-pro", prompt)
-
-    # 🛟 fallback
-    if not answer:
-        answer = call_gemini("gemini-flash-latest", prompt)
-
-    if not answer:
-        return "❌ لم أستطع توليد إجابة واضحة، حاول إعادة صياغة السؤال."
-
-    return (
-        answer.replace("{", "")
-              .replace("}", "")
-              .replace("[", "")
-              .replace("]", "")
-              .strip()
-    )
+# وظيفة وسيطة للتعامل مع التوقيت (Threading)
+def handle_async_reply(sender_id, user_text, image_url):
+    reply = get_ai_reply_multimodal(user_text, image_url)
+    send_fb_message(sender_id, reply)
 
 # ====== Webhook ======
 @app.route("/", methods=["GET"])
@@ -147,27 +83,28 @@ def verify():
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.json
-
     if data and data.get("object") == "page":
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
                 sender_id = event.get("sender", {}).get("id")
-                if not sender_id:
-                    continue
+                if not sender_id: continue
 
                 msg = event.get("message", {})
                 user_text = msg.get("text", "")
+                image_url = None
 
-                ocr_text = ""
+                # التقاط الصورة مباشرة
                 for att in msg.get("attachments", []):
                     if att.get("type") == "image":
-                        ocr_text = ocr_google(att["payload"]["url"])
+                        image_url = att["payload"]["url"]
 
-                if user_text or ocr_text:
-                    reply = get_ai_reply(user_text, ocr_text)
-                    send_fb_message(sender_id, reply)
+                if user_text or image_url:
+                    # نستخدم threading هنا لأن معالجة الصور تأخذ وقتاً
+                    # وبدونها سيعتقد فيسبوك أن البوت تعطل (Timeout)
+                    thread = threading.Thread(target=handle_async_reply, args=(sender_id, user_text, image_url))
+                    thread.start()
 
-    return "ok", 200
+    return "ok", 200 # نرد فوراً على فيسبوك لتجنب قطع الاتصال
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
