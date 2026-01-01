@@ -2,57 +2,83 @@ import os
 import requests
 import base64
 import io
-from flask import Flask, request
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+from flask import Flask, request
 
 app = Flask(__name__)
 
-# ================== ENV ==================
+# ====== إعدادات البيئة ======
 FB_PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
-FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
+FB_VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 VISION_API_KEY = os.environ.get("VISION_API_KEY")
 
-# ================== MEMORY ==================
+# ====== ذاكرة بسيطة ======
 conversations = {}
-MAX_HISTORY = 6
+MAX_HISTORY_MESSAGES = 8
 
-# ================== HELPERS ==================
-def safe_push(sender, role, text):
-    conversations.setdefault(sender, [])
-    conversations[sender].append({"role": role, "text": text})
-    conversations[sender] = conversations[sender][-MAX_HISTORY:]
+# ====== Utilities ======
+def push_history(sender_id, role, text):
+    history = conversations.get(sender_id, [])
+    history.append({"role": role, "text": text})
+    if len(history) > MAX_HISTORY_MESSAGES:
+        history = history[-MAX_HISTORY_MESSAGES:]
+    conversations[sender_id] = history
 
-def smart_chunks(text, limit=1700):
-    parts = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
+def build_prompt_from_history(sender_id, user_text, extra_note=""):
+    system_note = (
+        "أنت مساعد ذكي متخصص في حل تمارين وشرح دروس الفيزياء، الرياضيات والعلوم. "
+        "أجب باللغة العربية الفصحى المبسطة، وحافظ على المصطلحات العلمية باللغة الفرنسية كما هي. "
+        "اشرح لماذا (why) قبل كيف (how). "
+        "رقّم الشرح 1، 2، 3... "
+        "لا تستخدم رموز LaTeX أو كلمات مثل frac أو {} أو []. "
+        "اجعل الإجابة مفهومة لطالب ثانوي."
+    )
+
+    parts = [system_note, "\n--- محادثة سابقة ---\n"]
+    for item in conversations.get(sender_id, []):
+        role = "المستخدم" if item["role"] == "user" else "المساعد"
+        parts.append(f"{role}: {item['text']}\n")
+
+    parts.append("\nالمستخدم (الجديد): " + user_text)
+    parts.append("\nالمطلوب: أجب بشرح تفصيلي مبسط ومُرقّم.")
+    return "\n".join(parts)
+
+def chunk_text(text, max_len=1900):
+    chunks = []
+    while len(text) > max_len:
+        cut = text.rfind(" ", 0, max_len)
         if cut == -1:
-            cut = limit
-        parts.append(text[:cut])
+            cut = max_len
+        chunks.append(text[:cut])
         text = text[cut:]
-    parts.append(text)
-    return parts
+    chunks.append(text)
+    return chunks
 
-def fb_send(sender, text):
+def fb_send_chunks(recipient_id, full_text):
     url = "https://graph.facebook.com/v21.0/me/messages"
     params = {"access_token": FB_PAGE_ACCESS_TOKEN}
-    for chunk in smart_chunks(text):
-        payload = {
-            "recipient": {"id": sender},
-            "message": {"text": chunk.strip()}
-        }
+    for chunk in chunk_text(full_text):
+        payload = {"recipient": {"id": recipient_id}, "message": {"text": chunk.strip()}}
         requests.post(url, params=params, json=payload)
 
-# ================== OCR ==================
-def preprocess(img):
-    img = ImageOps.grayscale(img)
-    img = img.filter(ImageFilter.MedianFilter(3))
-    img = ImageEnhance.Contrast(img).enhance(1.6)
-    return img
+# ====== OCR ======
+def preprocess_image_for_ocr(image):
+    image = ImageOps.grayscale(image)
+    image = image.filter(ImageFilter.MedianFilter(size=3))
+    image = ImageEnhance.Contrast(image).enhance(1.4)
+    return image
 
-def ocr_google(img_bytes):
+def ocr_with_pytesseract(img_bytes):
+    try:
+        image = Image.open(io.BytesIO(img_bytes))
+        image = preprocess_image_for_ocr(image)
+        return pytesseract.image_to_string(image, lang="ara+fra+eng").strip()
+    except:
+        return ""
+
+def ocr_with_google_vision(img_bytes):
     if not VISION_API_KEY:
         return ""
     encoded = base64.b64encode(img_bytes).decode()
@@ -63,90 +89,114 @@ def ocr_google(img_bytes):
             "features": [{"type": "TEXT_DETECTION"}]
         }]
     }
-    r = requests.post(url, json=payload)
     try:
+        r = requests.post(url, json=payload, timeout=25)
         return r.json()["responses"][0]["fullTextAnnotation"]["text"]
     except:
         return ""
 
-def ocr_tesseract(img_bytes):
-    img = Image.open(io.BytesIO(img_bytes))
-    img = preprocess(img)
-    return pytesseract.image_to_string(img, lang="ara+fra+eng")
+def image_url_to_text(url):
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return ""
+        img_bytes = r.content
+        return ocr_with_google_vision(img_bytes) or ocr_with_pytesseract(img_bytes)
+    except:
+        return ""
 
-# ================== PROMPT ==================
-def build_prompt(sender, user_text):
-    system = """
-أنت مساعد تعليمي متخصص في حل تمارين الفيزياء والرياضيات والعلوم.
-- اشرح بالعربية الفصحى المبسطة.
-- حافظ على المصطلحات العلمية بالفرنسية كما هي.
-- اشرح لماذا (why) قبل كيف (how).
-- رقم الشرح: 1، 2، 3...
-- ممنوع استخدام LaTeX أو رموز مثل frac أو {} أو [].
-- اجعل الإجابة واضحة لطالب ثانوي.
-"""
-    history = ""
-    for h in conversations.get(sender, []):
-        role = "الطالب" if h["role"] == "user" else "المعلم"
-        history += f"{role}: {h['text']}\n"
+# ====== Gemini (المُعدل فقط) ======
+def get_gemini_response(user_text, sender_id):
+    try:
+        if not user_text or not user_text.strip():
+            return "لم أفهم السؤال، هل يمكنك توضيحه؟"
 
-    return f"{system}\n{history}\nالطالب: {user_text}\nالمعلم:"
+        lowered = user_text.lower()
 
-# ================== GEMINI ==================
-def ask_gemini(sender, text):
-    if any(x in text.lower() for x in ["من صنعك", "من برمجك", "who made you"]):
-        return (
-            "صنعني شخص اسمه محمد الأمين أحمد جدو.\n"
-            "هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
+        if ("من صنعك" in lowered) or ("من برمجك" in lowered) or ("who made you" in lowered):
+            return (
+                "صنعني شخص اسمه محمد الأمين أحمد جدو.\n"
+                "هو شخص متواضع ولا يحب إعطاء معلومات عن نفسه."
+            )
+
+        prompt_text = build_prompt_from_history(sender_id, user_text)
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+        }
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "temperature": 0.2
+        }
+
+        response = requests.post(url, json=payload, headers=headers, timeout=35)
+
+        if response.status_code != 200:
+            print("Gemini error:", response.text)
+            return "حدث خطأ أثناء المعالجة، حاول مرة أخرى."
+
+        data = response.json()
+
+        if "candidates" not in data:
+            print("No candidates:", data)
+            return "لم أستطع توليد إجابة واضحة، أعد صياغة السؤال."
+
+        ai_text = (
+            data["candidates"][0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
         )
 
-    prompt = build_prompt(sender, text)
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "temperature": 0.15,
-        "max_output_tokens": 1600
-    }
+        if not ai_text.strip():
+            return "لم أتوصل لإجابة مناسبة."
 
-    r = requests.post(url, json=payload, headers=headers)
-    if r.status_code != 200:
-        return "❌ حدث خطأ تقني، أعد المحاولة."
+        ai_text = ai_text.replace("{", "").replace("}", "").replace("[", "").replace("]", "")
+        return ai_text.strip()
 
-    try:
-        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return txt.replace("{", "").replace("}", "").replace("[", "").replace("]", "")
-    except:
-        return "❌ لم أستطع توليد إجابة واضحة."
+    except Exception as e:
+        print("Gemini exception:", e)
+        return "⚠️ خطأ تقني مؤقت."
 
-# ================== WEBHOOK ==================
+# ====== Webhook ======
 @app.route("/", methods=["GET"])
 def verify():
     if request.args.get("hub.verify_token") == FB_VERIFY_TOKEN:
         return request.args.get("hub.challenge")
-    return "error", 403
+    return "Verification failed", 403
 
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.json
-    for entry in data.get("entry", []):
-        for msg in entry.get("messaging", []):
-            sender = msg["sender"]["id"]
 
-            text = msg.get("message", {}).get("text", "")
+    if data and data.get("object") == "page":
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                sender_id = event.get("sender", {}).get("id")
+                if not sender_id:
+                    continue
 
-            for att in msg.get("message", {}).get("attachments", []):
-                if att["type"] == "image":
-                    img = requests.get(att["payload"]["url"]).content
-                    text += "\n" + (ocr_google(img) or ocr_tesseract(img))
+                if "message" in event:
+                    msg = event["message"]
+                    user_text = msg.get("text", "")
 
-            if text:
-                safe_push(sender, "user", text)
-                reply = ask_gemini(sender, text)
-                safe_push(sender, "assistant", reply)
-                fb_send(sender, reply)
+                    for att in msg.get("attachments", []):
+                        if att.get("type") == "image":
+                            url = att.get("payload", {}).get("url")
+                            if url:
+                                user_text += "\n" + image_url_to_text(url)
+
+                    if user_text:
+                        push_history(sender_id, "user", user_text)
+                        reply = get_gemini_response(user_text, sender_id)
+                        push_history(sender_id, "assistant", reply)
+                        fb_send_chunks(sender_id, reply)
 
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
