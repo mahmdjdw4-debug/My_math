@@ -4,28 +4,34 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# ===== ENV =====
+# ========= ENV =========
 PAGE_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "MySecretBot2024")
 GEMINI_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# ===== Facebook Send =====
+# ========= Facebook Send =========
 def send_message(psid, text):
+    if not text:
+        return
+
     url = "https://graph.facebook.com/v21.0/me/messages"
     params = {"access_token": PAGE_TOKEN}
     payload = {
         "recipient": {"id": psid},
         "message": {"text": text}
     }
-    requests.post(url, params=params, json=payload)
 
-# ===== Gemini =====
+    r = requests.post(url, params=params, json=payload)
+    if r.status_code != 200:
+        print("FB ERROR:", r.text)
+
+# ========= Gemini (نموذج يعمل) =========
 def ask_gemini(question):
     if not GEMINI_KEY:
         print("❌ NO GEMINI KEY")
         return None
 
-    url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent"
+    url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
 
     headers = {
         "Content-Type": "application/json",
@@ -36,33 +42,48 @@ def ask_gemini(question):
         "contents": [
             {
                 "parts": [
-                    {"text": "اشرح بأسلوب تعليمي مبسط:\n" + question}
+                    {
+                        "text": (
+                            "اشرح بأسلوب تعليمي مبسط لطالب ثانوي، "
+                            "وبلغة عربية واضحة:\n\n" + question
+                        )
+                    }
                 ]
             }
         ]
     }
 
-    r = requests.post(url, headers=headers, json=payload)
-    print("GEMINI STATUS:", r.status_code)
-    print("RAW:", r.text)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        print("GEMINI STATUS:", r.status_code)
+        print("GEMINI RAW:", r.text)
 
-    if r.status_code != 200:
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
+        if "candidates" not in data or not data["candidates"]:
+            return None
+
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    except Exception as e:
+        print("❌ GEMINI EXCEPTION:", e)
         return None
 
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
-
-# ===== Verify =====
+# ========= Webhook Verify =========
 @app.route("/", methods=["GET"])
 def verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
         return request.args.get("hub.challenge")
     return "Forbidden", 403
 
-# ===== Webhook =====
+# ========= Webhook Receive =========
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.json
+    print("📩 INCOMING:", data)
 
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
@@ -74,11 +95,18 @@ def webhook():
 
             text = msg.strip().lower()
 
+            # ===== ردود محلية =====
             if text in ["مرحبا", "السلام عليكم", "hi", "hello"]:
-                send_message(sender, "أهلاً بك 👋")
+                send_message(sender, "أهلاً بك 👋 كيف أستطيع مساعدتك؟")
                 continue
 
+            if "من صنعك" in text:
+                send_message(sender, "صنعني محمد الأمين أحمد جدو 🤍")
+                continue
+
+            # ===== Gemini =====
             reply = ask_gemini(msg)
+
             if not reply:
                 reply = "❌ حدث خطأ مؤقت، حاول لاحقاً."
 
@@ -86,5 +114,7 @@ def webhook():
 
     return "ok", 200
 
+# ========= Run =========
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
